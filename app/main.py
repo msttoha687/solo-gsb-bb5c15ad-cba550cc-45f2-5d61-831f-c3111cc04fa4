@@ -116,8 +116,9 @@ def put_config(body: ConfigIn):
     )
     with db.connect() as conn:
         db.update_config(conn, cfg)
-        # 规则参数变化后，旧账单可能已不再成立，标记为失效
-        db.clear_bills(conn)
+        # 规则参数变化后，旧账单可能已不再成立：
+        # 同一事务内递增数据版本并使旧账单失效
+        db.invalidate_bills(conn)
     return {"ok": True}
 
 
@@ -138,7 +139,7 @@ def put_stations(body: TextIn):
         return _parse_error_response(errors)
     with db.connect() as conn:
         db.replace_stations(conn, stations)
-        db.clear_bills(conn)
+        db.invalidate_bills(conn)
     return {"ok": True, "count": len(stations)}
 
 
@@ -159,7 +160,7 @@ def put_fares(body: TextIn):
         return _parse_error_response(errors)
     with db.connect() as conn:
         db.replace_fares(conn, fares)
-        db.clear_bills(conn)
+        db.invalidate_bills(conn)
     return {"ok": True, "count": len(fares)}
 
 
@@ -181,7 +182,7 @@ def put_records(body: TextIn):
         return _parse_error_response(errors)
     with db.connect() as conn:
         db.replace_records(conn, records)
-        db.clear_bills(conn)
+        db.invalidate_bills(conn)
     return {"ok": True, "count": len(records)}
 
 
@@ -189,28 +190,68 @@ def put_records(body: TextIn):
 # 核验
 # ---------------------------------------------------------------------------
 
-@app.post("/api/verify")
-def run_verify():
-    """执行全量核验。
+def _read_verify_snapshot():
+    """在单个只读事务内读取核验输入与数据版本（一致快照）。
 
-    成功：清空旧账单并写入新账单（同一事务）。
-    失败：返回 422 与全部定位错误，不写入/保留任何账单（无部分账单）。
+    显式 BEGIN 使配置、站点、票价、刷卡记录与版本号来自同一个
+    SQLite 快照；事务随连接关闭即结束，计价计算期间不持有任何
+    数据库连接或写锁，并发保存不受影响。
     """
     with db.connect() as conn:
+        conn.execute("BEGIN")
         cfg = db.get_config(conn)
         stations, fares, records = db.load_domain(conn)
-        result = verify(stations, fares, records, cfg)
-        if not result.ok:
+        version = db.get_data_version(conn)
+    return cfg, stations, fares, records, version
+
+
+def _commit_verify_result(result, version: int) -> bool:
+    """提交核验结果：同一事务内复查数据版本，一致才写 / 清账单。
+
+    BEGIN IMMEDIATE 在事务开始即取得写锁，版本检查与账单写入之间
+    不会有其他保存事务插入；版本号已变化（核验期间有保存）时返回
+    False，账单与核验时间均不改动。
+    """
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if db.get_data_version(conn) != version:
+            return False
+        if result.ok:
+            db.save_bills(conn, result.bills)
+        else:
             db.clear_bills(conn)
-            return JSONResponse(
-                status_code=422,
-                content={"ok": False,
-                         "errors": result.errors,
-                         "bill_count": 0})
-        db.save_bills(conn, result.bills)
-        return {"ok": True,
-                "bill_count": len(result.bills),
-                "bills": result.bills}
+    return True
+
+
+@app.post("/api/verify")
+def run_verify():
+    """执行全量核验（乐观并发控制）。
+
+    - 从一致快照读取输入与数据版本，计算期间不持有数据库写锁；
+    - 提交前在同一事务内复查版本：版本已变（核验期间站点 / 票价 /
+      记录 / 配置被保存）则返回 409 与 DATA_CHANGED，
+      账单与核验时间均不改动；
+    - 版本一致时：成功则清空旧账单并写入新账单（同一事务），
+      失败则清空旧账单并返回 422 与全部定位错误（无部分账单）。
+    """
+    cfg, stations, fares, records, version = _read_verify_snapshot()
+    result = verify(stations, fares, records, cfg)
+    if not _commit_verify_result(result, version):
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False,
+                     "code": "DATA_CHANGED",
+                     "message": "数据已变化：核验期间站点 / 票价 / 记录 / "
+                                "配置被修改，账单未改动，请重新核验"})
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False,
+                     "errors": result.errors,
+                     "bill_count": 0})
+    return {"ok": True,
+            "bill_count": len(result.bills),
+            "bills": result.bills}
 
 
 @app.get("/api/bills")

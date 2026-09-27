@@ -17,6 +17,7 @@ async function api(path, options = {}) {
   } catch (_) { /* 非 JSON 响应 */ }
   if (!resp.ok) {
     const err = new Error("HTTP " + resp.status);
+    err.status = resp.status;
     err.payload = data;
     throw err;
   }
@@ -371,6 +372,14 @@ function renderBills(bills) {
   }
 }
 
+async function refreshBills() {
+  // 以服务器当前账单为准刷新账单区（核验冲突后调用）
+  const bills = await api("/api/bills");
+  renderBills(bills.items || []);
+  $("bills-panel").hidden = bills.count === 0;
+  return bills;
+}
+
 async function runVerify() {
   const status = $("verify-status");
   status.textContent = "核验中…";
@@ -384,6 +393,20 @@ async function runVerify() {
     status.className = "status ok";
     toast(`核验通过：${data.bill_count} 笔行程`);
   } catch (e) {
+    if (e.status === 409) {
+      // 核验期间数据被并发修改：本次未改动账单，
+      // 提示数据已变化、需重新核验，并以服务器当前账单刷新账单区
+      const msg = (e.payload && e.payload.message) ||
+        "数据已变化，请重新核验";
+      status.textContent = msg;
+      status.className = "status bad";
+      toast("数据已变化，需重新核验", false);
+      $("errors-panel").hidden = true;
+      try {
+        await refreshBills();
+      } catch (_) { /* 刷新失败时保留提示 */ }
+      return;
+    }
     const errors = (e.payload && e.payload.errors) || [];
     const ul = $("errors-list");
     ul.innerHTML = "";

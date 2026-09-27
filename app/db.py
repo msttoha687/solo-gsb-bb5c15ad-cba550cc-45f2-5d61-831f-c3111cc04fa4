@@ -2,6 +2,8 @@
 
 同步驱动 sqlite3，每请求一个连接。金额以整数分存储，
 刷卡时刻以 'YYYY-MM-DD HH:MM:SS' 文本存储（可直接排序）。
+meta 表中的 data_version 为站点 / 票价 / 记录 / 配置共用的
+持久化数据版本号：保存时递增，核验提交前复查，冲突检测跨进程生效。
 """
 from __future__ import annotations
 
@@ -93,6 +95,10 @@ DEFAULT_CONFIG = {
     "day_split_hour": "4",
 }
 
+# 数据版本号在 meta 表中的键：站点 / 票价 / 刷卡记录 / 配置任一保存都会
+# 使其递增。版本号持久化在数据库中，因此并发核验的冲突检测跨进程生效。
+DATA_VERSION_KEY = "data_version"
+
 
 @contextmanager
 def connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
@@ -117,6 +123,10 @@ def init_db(db_path: Optional[str] = None) -> None:
         for k, v in DEFAULT_CONFIG.items():
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)", (k, v))
+        # 旧库自动升级：缺少数据版本号时补齐为 0（已存在则保留原值）
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+            (DATA_VERSION_KEY, "0"))
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +184,23 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "INSERT INTO meta(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value))
+
+
+# ---------------------------------------------------------------------------
+# 数据版本（持久化，跨进程生效）
+# ---------------------------------------------------------------------------
+
+def get_data_version(conn: sqlite3.Connection) -> int:
+    """当前数据版本号；旧库缺少该键时按 0 处理。"""
+    v = get_meta(conn, DATA_VERSION_KEY)
+    return int(v) if v is not None else 0
+
+
+def bump_data_version(conn: sqlite3.Connection) -> int:
+    """在同一事务内递增数据版本号，返回新版本号。"""
+    new = get_data_version(conn) + 1
+    set_meta(conn, DATA_VERSION_KEY, str(new))
+    return new
 
 
 def get_config(conn: sqlite3.Connection) -> Config:
@@ -246,6 +273,17 @@ def save_bills(conn: sqlite3.Connection, bills: list[dict]) -> None:
 def clear_bills(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM trip_bill")
     conn.execute("DELETE FROM meta WHERE key='last_verified_at'")
+
+
+def invalidate_bills(conn: sqlite3.Connection) -> None:
+    """基础数据保存后的同事务收尾：递增数据版本并使旧账单失效。
+
+    站点 / 票价 / 刷卡记录 / 配置的保存操作必须在同一事务内依次完成
+    「更新数据 → 递增版本 → 清空账单」，核验提交前会复查版本号，
+    版本变化即拒绝写回过期账单（返回 409 DATA_CHANGED）。
+    """
+    bump_data_version(conn)
+    clear_bills(conn)
 
 
 # ---------------------------------------------------------------------------
