@@ -371,6 +371,19 @@ function renderBills(bills) {
   }
 }
 
+async function refreshBills() {
+  // 重新拉取当前账单并刷新展示（冲突后账单以后端最新状态为准）
+  const bills = await api("/api/bills");
+  if (bills.count > 0) {
+    renderBills(bills.items);
+    $("bills-panel").hidden = false;
+    $("errors-panel").hidden = true;
+  } else {
+    $("bills-panel").hidden = true;
+  }
+  return bills;
+}
+
 async function runVerify() {
   const status = $("verify-status");
   status.textContent = "核验中…";
@@ -384,6 +397,18 @@ async function runVerify() {
     status.className = "status ok";
     toast(`核验通过：${data.bill_count} 笔行程`);
   } catch (e) {
+    if (e.payload && e.payload.data_changed) {
+      // 并发冲突：核验期间数据已被其他保存操作修改，本次结果未写入，
+      // 账单与核验时间保持后端最新状态——重新拉取账单并提示重新核验
+      $("errors-panel").hidden = true;
+      try {
+        await refreshBills();
+      } catch (_) { /* 刷新失败不影响冲突提示 */ }
+      status.textContent = "数据已在核验期间变化，本次核验未生效，请重新核验";
+      status.className = "status bad";
+      toast("数据已变化，请重新核验", false);
+      return;
+    }
     const errors = (e.payload && e.payload.errors) || [];
     const ul = $("errors-list");
     ul.innerHTML = "";

@@ -93,6 +93,12 @@ DEFAULT_CONFIG = {
     "day_split_hour": "4",
 }
 
+# 数据版本（meta 表键）：站点分区、票价矩阵、刷卡记录与规则参数
+# 每次保存都在同一事务内递增该版本并使账单失效；核验据此发现
+# 「读取快照之后数据已被其他请求修改」的并发冲突。版本持久化在
+# 数据库中，跨进程生效；旧数据库启动时由 init_db 自动补齐。
+DATA_VERSION_KEY = "data_version"
+
 
 @contextmanager
 def connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
@@ -101,6 +107,8 @@ def connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 写锁冲突时短暂等待而非立即报错：核验提交与保存操作可能跨进程并发
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -117,6 +125,10 @@ def init_db(db_path: Optional[str] = None) -> None:
         for k, v in DEFAULT_CONFIG.items():
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)", (k, v))
+        # 数据版本：旧数据库启动时自动补齐；已存在则保留当前值
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+            (DATA_VERSION_KEY, "0"))
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +186,45 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "INSERT INTO meta(key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value))
+
+
+# ---------------------------------------------------------------------------
+# 数据版本（并发核验保护）
+# ---------------------------------------------------------------------------
+
+def get_data_version(conn: sqlite3.Connection) -> int:
+    """当前数据版本：站点 / 票价 / 刷卡记录 / 配置的累计保存次数。"""
+    v = get_meta(conn, DATA_VERSION_KEY)
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_data_version(conn: sqlite3.Connection) -> int:
+    """在同一事务内递增数据版本（保存操作的调用方负责同事务使账单失效）。"""
+    v = get_data_version(conn) + 1
+    set_meta(conn, DATA_VERSION_KEY, str(v))
+    return v
+
+
+def begin_snapshot(conn: sqlite3.Connection) -> None:
+    """开启显式读事务：其后的多次读取来自同一一致快照。
+
+    只持有读（SHARED）锁，读取结束应立即 rollback / commit 释放，
+    避免长时间阻塞并发写入。
+    """
+    conn.execute("BEGIN")
+
+
+def begin_write(conn: sqlite3.Connection) -> None:
+    """开启显式写事务并立即获取写锁（BEGIN IMMEDIATE）。
+
+    版本复查与账单写入在同一事务内完成：事务提交前，其他连接的
+    写事务无法介入，因此「版本未变」的结论在提交时仍然成立，
+    该保护跨进程生效。
+    """
+    conn.execute("BEGIN IMMEDIATE")
 
 
 def get_config(conn: sqlite3.Connection) -> Config:

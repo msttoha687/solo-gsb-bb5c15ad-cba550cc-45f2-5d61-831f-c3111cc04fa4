@@ -58,7 +58,7 @@ app = FastAPI(
     title="公交刷卡票价核验台",
     description="录入站点分区、票价矩阵、换乘抵扣、每日封顶与刷卡记录，"
                 "按卡号配对进出站并核验计价。",
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -116,7 +116,9 @@ def put_config(body: ConfigIn):
     )
     with db.connect() as conn:
         db.update_config(conn, cfg)
-        # 规则参数变化后，旧账单可能已不再成立，标记为失效
+        # 规则参数变化后，旧账单可能已不再成立：
+        # 同一事务内更新数据、递增数据版本并使账单失效
+        db.bump_data_version(conn)
         db.clear_bills(conn)
     return {"ok": True}
 
@@ -138,6 +140,7 @@ def put_stations(body: TextIn):
         return _parse_error_response(errors)
     with db.connect() as conn:
         db.replace_stations(conn, stations)
+        db.bump_data_version(conn)
         db.clear_bills(conn)
     return {"ok": True, "count": len(stations)}
 
@@ -159,6 +162,7 @@ def put_fares(body: TextIn):
         return _parse_error_response(errors)
     with db.connect() as conn:
         db.replace_fares(conn, fares)
+        db.bump_data_version(conn)
         db.clear_bills(conn)
     return {"ok": True, "count": len(fares)}
 
@@ -181,6 +185,7 @@ def put_records(body: TextIn):
         return _parse_error_response(errors)
     with db.connect() as conn:
         db.replace_records(conn, records)
+        db.bump_data_version(conn)
         db.clear_bills(conn)
     return {"ok": True, "count": len(records)}
 
@@ -189,17 +194,57 @@ def put_records(body: TextIn):
 # 核验
 # ---------------------------------------------------------------------------
 
+def _data_changed_response() -> JSONResponse:
+    """核验期间输入数据已被其他保存操作修改：409 + DATA_CHANGED。
+
+    账单与核验时间均保持不变，由调用方提示用户重新核验。
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "ok": False,
+            "data_changed": True,
+            "errors": [{
+                "code": "DATA_CHANGED",
+                "message": "站点 / 票价 / 刷卡记录或配置在核验期间已被其他操作修改，"
+                           "本次核验结果未写入（账单与核验时间保持不变），请重新核验",
+            }],
+        })
+
+
 @app.post("/api/verify")
 def run_verify():
-    """执行全量核验。
+    """执行全量核验（带数据版本并发保护）。
 
-    成功：清空旧账单并写入新账单（同一事务）。
-    失败：返回 422 与全部定位错误，不写入/保留任何账单（无部分账单）。
+    - 一致快照：显式读事务内一次性读出核验输入（配置 / 站点 / 票价 /
+      刷卡记录）与数据版本，随后立即释放读锁；
+    - 纯内存计算：核验期间不持有数据库连接与写锁，不阻塞并发读写；
+    - 原子提交：写事务（BEGIN IMMEDIATE）内先复查数据版本——若核验
+      期间另一请求保存过站点 / 票价 / 记录 / 配置（版本已递增），
+      返回 409 与 DATA_CHANGED，不写回过期账单、不清空新账单、
+      不改核验时间；版本一致时，成功则清空旧账单并写入新账单，
+      失败则清空账单并返回 422 与全部定位错误（无部分账单）。
     """
+    # 1) 一致快照：读取输入与数据版本后立即释放读锁
     with db.connect() as conn:
-        cfg = db.get_config(conn)
-        stations, fares, records = db.load_domain(conn)
-        result = verify(stations, fares, records, cfg)
+        db.begin_snapshot(conn)
+        try:
+            cfg = db.get_config(conn)
+            stations, fares, records = db.load_domain(conn)
+            version = db.get_data_version(conn)
+        finally:
+            conn.rollback()  # 只读快照：读完即释放，不持锁计算
+
+    # 2) 纯内存计算：不持有数据库连接 / 写锁
+    result = verify(stations, fares, records, cfg)
+
+    # 3) 写事务：版本复查与账单写入在同一事务内（跨进程互斥）
+    with db.connect() as conn:
+        db.begin_write(conn)
+        if db.get_data_version(conn) != version:
+            # 数据已在核验期间变化：本次结果基于过期快照，一律丢弃
+            conn.rollback()
+            return _data_changed_response()
         if not result.ok:
             db.clear_bills(conn)
             return JSONResponse(
